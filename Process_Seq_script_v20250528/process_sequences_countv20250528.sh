@@ -1,4 +1,3 @@
-
 #!/bin/bash
 
 # 默认值
@@ -25,9 +24,10 @@ process_single_file_in_background() {
     local gz_file="$1"
     local current_sample_name
     local current_cmd_prefix_for_grep 
-    local current_denominator_for_percentage
+    local lines_scanned_for_denominator # 实际扫描的总行数
+    local current_total_reads_processed # Reads 数 (行数/4)
     local -a current_pattern_array 
-    local current_all_fwd_count current_all_rc_count
+    local current_all_fwd_line_count current_all_rc_line_count # 仍然是行计数
     local original_pattern_iter rc_pattern_iter 
     local cmd_all_fwd_chain_parts cmd_all_rc_chain_parts 
     local local_has_patterns_fwd local_has_patterns_rc
@@ -35,7 +35,7 @@ process_single_file_in_background() {
     local fwd_count_output rc_count_output
     local all_fwd_count_val all_rc_count_val
     local current_all_fwd_percentage_val current_all_rc_percentage_val
-    local total_lines_output 
+    local total_lines_output_wc # wc -l 的原始输出
 
     current_sample_name=$(basename "$gz_file" .gz)
     
@@ -44,18 +44,24 @@ process_single_file_in_background() {
         current_cmd_prefix_for_grep+=" | head -n $effective_lines_to_process"
     fi
 
-    total_lines_output=$(eval "$current_cmd_prefix_for_grep | wc -l" 2>/dev/null)
-    current_denominator_for_percentage=$(echo "$total_lines_output" | awk '{print $1}')
-    if ! [[ "$current_denominator_for_percentage" =~ ^[0-9]+$ ]]; then
-        current_denominator_for_percentage=0
+    # 获取实际处理的行数
+    total_lines_output_wc=$(eval "$current_cmd_prefix_for_grep | wc -l" 2>/dev/null)
+    lines_scanned_for_denominator=$(echo "$total_lines_output_wc" | awk '{print $1}')
+    if ! [[ "$lines_scanned_for_denominator" =~ ^[0-9]+$ ]]; then
+        lines_scanned_for_denominator=0
     fi
+    
+    # 计算总处理Reads数
+    current_total_reads_processed=$((lines_scanned_for_denominator / 4))
+
 
     IFS=',' read -r -a current_pattern_array <<< "$patterns_string"
     
-    current_all_fwd_count=0
-    current_all_rc_count=0
+    current_all_fwd_line_count=0 # 匹配的行数
+    current_all_rc_line_count=0  # 匹配的行数
 
-    cmd_all_fwd_chain_parts="$current_cmd_prefix_for_grep"
+    # 计算全正向共现行数
+    cmd_all_fwd_chain_parts="$current_cmd_prefix_for_grep" # grep 仍然作用于 zcat | head 的输出
     local_has_patterns_fwd=0
     for original_pattern_iter in "${current_pattern_array[@]}"; do
         if [ ! -z "$original_pattern_iter" ]; then
@@ -69,11 +75,12 @@ process_single_file_in_background() {
         fwd_count_output=$(eval "$cmd_all_fwd_count_full" 2>/dev/null)
         all_fwd_count_val=$(echo "$fwd_count_output" | awk '{print $1}')
         if [[ "$all_fwd_count_val" =~ ^[0-9]+$ ]]; then
-            current_all_fwd_count=$all_fwd_count_val
+            current_all_fwd_line_count=$all_fwd_count_val
         fi
     fi
 
-    cmd_all_rc_chain_parts="$current_cmd_prefix_for_grep"
+    # 计算全反向互补共现行数
+    cmd_all_rc_chain_parts="$current_cmd_prefix_for_grep" # grep 仍然作用于 zcat | head 的输出
     local_has_patterns_rc=0
     for original_pattern_iter in "${current_pattern_array[@]}"; do
         if [ ! -z "$original_pattern_iter" ]; then
@@ -88,20 +95,24 @@ process_single_file_in_background() {
         rc_count_output=$(eval "$cmd_all_rc_count_full" 2>/dev/null)
         all_rc_count_val=$(echo "$rc_count_output" | awk '{print $1}')
         if [[ "$all_rc_count_val" =~ ^[0-9]+$ ]]; then
-            current_all_rc_count=$all_rc_count_val
+            current_all_rc_line_count=$all_rc_count_val
         fi
     fi
             
     current_all_fwd_percentage_val="N/A"
     current_all_rc_percentage_val="N/A"
 
-    if [ "$current_denominator_for_percentage" -gt 0 ]; then
-        current_all_fwd_percentage_val=$(awk -v c="$current_all_fwd_count" -v t="$current_denominator_for_percentage" 'BEGIN {printf "%.2f%%", (c/t)*100}')
-        current_all_rc_percentage_val=$(awk -v c="$current_all_rc_count" -v t="$current_denominator_for_percentage" 'BEGIN {printf "%.2f%%", (c/t)*100}')
+    if [ "$current_total_reads_processed" -gt 0 ]; then # 使用 Reads 数作为百分比分母
+        current_all_fwd_percentage_val=$(awk -v c="$current_all_fwd_line_count" -v t="$current_total_reads_processed" 'BEGIN {if (t>0) printf "%.2f%%", (c/t)*100; else print "N/A"}')
+        current_all_rc_percentage_val=$(awk -v c="$current_all_rc_line_count" -v t="$current_total_reads_processed" 'BEGIN {if (t>0) printf "%.2f%%", (c/t)*100; else print "N/A"}')
+    elif [ "$current_all_fwd_line_count" -eq 0 ] && [ "$current_all_rc_line_count" -eq 0 ] && [ "$current_total_reads_processed" -eq 0 ]; then
+        # 如果处理0个reads且匹配0行，百分比为N/A
+        current_all_fwd_percentage_val="N/A"
+        current_all_rc_percentage_val="N/A"
     fi
             
     # sequence_description 是从父脚本继承的全局变量
-    echo -e "$current_sample_name\t$sequence_description\t$patterns_string\t$current_all_fwd_count\t$current_all_rc_count\t$current_denominator_for_percentage\t$current_all_fwd_percentage_val\t$current_all_rc_percentage_val"
+    echo -e "$current_sample_name\t$sequence_description\t$patterns_string\t$current_all_fwd_line_count\t$current_all_rc_line_count\t$current_total_reads_processed\t$current_all_fwd_percentage_val\t$current_all_rc_percentage_val"
 }
 
 
@@ -111,8 +122,8 @@ usage() {
     echo "选项:"
     echo "  -p <序列列表>   : (必需) 逗号分隔的多个原始搜索序列。"
     echo "                    脚本将计算两种共现计数："
-    echo "                    1. 全正向共现: 同时匹配所有原始序列的行数。"
-    echo "                    2. 全反向互补共现: 同时匹配所有原始序列各自的反向互补序列的行数。"
+    echo "                    1. 全正向共现行数: 同时匹配所有原始序列的行数。"
+    echo "                    2. 全反向互补共现行数: 同时匹配所有原始序列各自的反向互补序列的行数。"
     echo "  -d <描述>       : (可选) 对当前查询的序列组合的描述性名称。默认为 \"$default_sequence_description\"。"
     echo "  -i <输入模式>   : (可选) 输入 .gz 文件的匹配模式。 默认: \"*gz\""
     echo "  -o <输出文件>   : (可选) 输出 TSV 文件的路径和名称."
@@ -229,7 +240,7 @@ fi
 shopt -s nullglob 
 
 # 定义表头
-header=$(echo -e "样本\t序列描述\t查询序列组合\t全正向共现计数\t全反向互补共现计数\t总处理行数\t全正向比例(%)\t全反向互补比例(%)")
+header=$(echo -e "样本\t序列描述\t查询序列组合\t全正向共现行数\t全反向互补共现行数\t总处理Reads数\t全正向比例(%)\t全反向互补比例(%)")
 
 # 收集所有后台作业的输出
 body_unsorted=$(
@@ -260,4 +271,3 @@ body_unsorted=$(
 ) | tee "$final_output_path"
 
 exit 0
-
